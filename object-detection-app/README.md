@@ -183,3 +183,8 @@ Nếu có vấn đề hoặc đóng góp ý kiến, vui lòng tạo Issue trên 
 ---
 
 *Được phát triển với ❤️ bởi AI Assistant*
+# Bước 1: Chuyển vào thư mục dự án
+cd "C:\Users\PC\Desktop\AI\object-detection-app"
+
+# Bước 2: Chạy ứng dụng
+C:/Users/PC/Desktop/AI/.venv/Scripts/python.exe object_detection_app.py

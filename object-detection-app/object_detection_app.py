@@ -26,7 +26,11 @@ class ObjectDetectionApp:
         self.log_data = []
         self.object_counts = defaultdict(int)
         self.detection_history = defaultdict(list)  # Lịch sử nhận diện để lọc nhiễu
-        self.max_history = 10  # Giữ 10 frame gần nhất
+        self.max_history = 15  # Tăng lên 15 frame để học tốt hơn
+        self.object_stability = defaultdict(int)  # Đếm độ ổn định của từng đối tượng
+        self.false_positive_penalty = defaultdict(float)  # Phạt các detection hay sai
+        self.learning_rate = 0.1  # Tốc độ học
+        self.smart_mode = "normal"  # normal, strict, sensitive
         
         # Từ điển dịch tên đối tượng sang tiếng Việt (tên đầy đủ cho CSV)
         self.vietnamese_names = {
@@ -197,6 +201,15 @@ class ObjectDetectionApp:
         
         print("🚀 Đang khởi tạo Object Detection App...")
         
+        # Context rules - đối tượng thường xuất hiện cùng nhau
+        self.context_rules = {
+            'laptop': ['mouse', 'keyboard', 'cell phone'],  # Laptop thường đi với chuột, bàn phím
+            'dining table': ['chair', 'cup', 'bowl', 'fork', 'knife', 'spoon'],  # Bàn ăn với đồ ăn
+            'person': ['cell phone', 'handbag', 'book'],  # Người thường có điện thoại, túi
+            'kitchen': ['refrigerator', 'microwave', 'sink', 'bottle'],
+            'office': ['laptop', 'keyboard', 'mouse', 'book', 'scissors']
+        }
+        
         # Confidence thresholds riêng cho từng loại đối tượng
         self.confidence_thresholds = {
             # Đối tượng dễ nhầm lẫn - yêu cầu confidence cao hơn
@@ -235,25 +248,137 @@ class ObjectDetectionApp:
         """Lấy confidence threshold phù hợp cho từng loại đối tượng"""
         return self.confidence_thresholds.get(class_name, self.confidence_thresholds['default'])
     
-    def is_stable_detection(self, class_name, confidence):
-        """Kiểm tra xem nhận diện có ổn định không (lọc nhiễu)"""
-        # Thêm vào lịch sử
-        self.detection_history[class_name].append(confidence)
+    def is_reasonable_size(self, class_name, bbox_width, bbox_height, frame_width, frame_height):
+        """Kiểm tra kích thước bounding box có hợp lý không"""
+        bbox_area_ratio = (bbox_width * bbox_height) / (frame_width * frame_height)
+        
+        # Định nghĩa kích thước hợp lý cho từng loại đối tượng
+        size_ranges = {
+            # Đối tượng nhỏ (2-15% màn hình)
+            'cell phone': (0.02, 0.15),
+            'mouse': (0.01, 0.08),
+            'remote': (0.02, 0.12),
+            'book': (0.03, 0.20),
+            'scissors': (0.01, 0.10),
+            'knife': (0.005, 0.08),
+            'fork': (0.005, 0.05),
+            'spoon': (0.005, 0.05),
+            'cup': (0.02, 0.15),
+            'bottle': (0.02, 0.20),
+            
+            # Đối tượng trung bình (10-40% màn hình)
+            'laptop': (0.10, 0.40),
+            'keyboard': (0.08, 0.30),
+            'tv': (0.15, 0.60),
+            'chair': (0.15, 0.50),
+            
+            # Đối tượng lớn (20-80% màn hình)
+            'person': (0.20, 0.80),
+            'couch': (0.25, 0.70),
+            'bed': (0.30, 0.80),
+            'car': (0.25, 0.85),
+            
+            # Mặc định
+            'default': (0.01, 0.60)
+        }
+        
+        min_size, max_size = size_ranges.get(class_name, size_ranges['default'])
+        return min_size <= bbox_area_ratio <= max_size
+    
+    def is_reasonable_position(self, class_name, x1, y1, x2, y2, frame_width, frame_height):
+        """Kiểm tra vị trí đối tượng có hợp lý không"""
+        center_x = (x1 + x2) / 2
+        center_y = (y1 + y2) / 2
+        
+        # Một số đối tượng thường xuất hiện ở vị trí đặc biệt
+        position_rules = {
+            'laptop': lambda cx, cy: cy > frame_height * 0.3,  # Laptop thường ở phần dưới
+            'tv': lambda cx, cy: cy < frame_height * 0.7,      # TV thường ở phần trên/giữa
+            'ceiling fan': lambda cx, cy: cy < frame_height * 0.3,  # Quạt trần ở trên
+            'chair': lambda cx, cy: cy > frame_height * 0.2,   # Ghế thường ở phần dưới
+        }
+        
+        if class_name in position_rules:
+            return position_rules[class_name](center_x, center_y)
+        
+        return True  # Không có rule đặc biệt thì chấp nhận
+    
+    def get_context_boost(self, class_name, current_detections):
+        """Tăng độ tin cậy dựa trên ngữ cảnh (đối tượng khác trong khung hình)"""
+        boost = 0.0
+        
+        for main_object, related_objects in self.context_rules.items():
+            if class_name in related_objects:
+                # Nếu đối tượng chính xuất hiện, tăng độ tin cậy cho related objects
+                if main_object in current_detections:
+                    boost += 0.05
+                    
+        # Tăng độ tin cậy nếu có nhiều đối tượng cùng context
+        context_count = 0
+        for main_object, related_objects in self.context_rules.items():
+            if class_name == main_object or class_name in related_objects:
+                context_count += sum(1 for obj in related_objects if obj in current_detections)
+                
+        if context_count >= 2:
+            boost += 0.03 * context_count
+            
+        return min(boost, 0.15)  # Giới hạn boost tối đa 15%
+    
+    def is_stable_detection(self, class_name, confidence, bbox_area):
+        """Kiểm tra xem nhận diện có ổn định không (lọc nhiễu thông minh)"""
+        # Thêm vào lịch sử với thông tin bổ sung
+        detection_info = {
+            'confidence': confidence,
+            'area': bbox_area,
+            'timestamp': time.time()
+        }
+        
+        self.detection_history[class_name].append(detection_info)
         
         # Giữ chỉ max_history frame gần nhất
         if len(self.detection_history[class_name]) > self.max_history:
             self.detection_history[class_name].pop(0)
         
-        # Yêu cầu ít nhất 3 frame liên tiếp để xác nhận
-        if len(self.detection_history[class_name]) < 3:
+        # Cần ít nhất 4 frame để đánh giá
+        if len(self.detection_history[class_name]) < 4:
             return False
         
-        # Kiểm tra 3 frame gần nhất có confidence > threshold không
-        recent_detections = self.detection_history[class_name][-3:]
+        recent_detections = self.detection_history[class_name][-4:]
         threshold = self.get_confidence_threshold(class_name)
         
-        stable_count = sum(1 for conf in recent_detections if conf > threshold)
-        return stable_count >= 2  # Ít nhất 2/3 frame gần nhất phải > threshold
+        # Áp dụng phạt nếu đối tượng này hay sai
+        adjusted_threshold = threshold + self.false_positive_penalty.get(class_name, 0.0)
+        
+        # Kiểm tra độ ổn định về confidence
+        confidence_stable = sum(1 for d in recent_detections if d['confidence'] > adjusted_threshold) >= 3
+        
+        # Kiểm tra độ ổn định về kích thước bounding box
+        areas = [d['area'] for d in recent_detections]
+        area_variance = np.var(areas) if len(areas) > 1 else 0
+        area_stable = area_variance < (bbox_area * 0.3)  # Biến thiên kích thước < 30%
+        
+        # Kiểm tra tần suất xuất hiện
+        time_gaps = []
+        for i in range(1, len(recent_detections)):
+            gap = recent_detections[i]['timestamp'] - recent_detections[i-1]['timestamp']
+            time_gaps.append(gap)
+        
+        # Đối tượng thật thường xuất hiện liên tục
+        frequency_stable = len(time_gaps) == 0 or max(time_gaps) < 2.0  # Không bị gián đoạn > 2s
+        
+        is_stable = confidence_stable and area_stable and frequency_stable
+        
+        # Cập nhật độ ổn định
+        if is_stable:
+            self.object_stability[class_name] += 1
+            # Giảm penalty nếu ổn định
+            if self.false_positive_penalty.get(class_name, 0) > 0:
+                self.false_positive_penalty[class_name] *= 0.9
+        else:
+            # Tăng penalty nếu không ổn định (có thể là false positive)
+            self.false_positive_penalty[class_name] = self.false_positive_penalty.get(class_name, 0) + 0.05
+            
+        return is_stable
     
     def get_vietnamese_names(self, english_name):
         """Lấy tên tiếng Việt cho hiển thị và lưu CSV"""
@@ -292,9 +417,11 @@ class ObjectDetectionApp:
             print(f"❌ Lỗi camera: {e}")
             return False
     
-    def draw_predictions(self, frame, results):
+    def draw_predictions(self, frame, results, all_detections=None):
         """Vẽ bounding box và label lên frame"""
         current_objects = Counter()
+        if all_detections is None:
+            all_detections = []
         
         for result in results:
             boxes = result.boxes
@@ -313,19 +440,52 @@ class ObjectDetectionApp:
                         confidence_threshold = self.get_confidence_threshold(class_name)
                         vietnamese_name, display_name = self.get_vietnamese_names(class_name)
                         
+                        # Tính toán thông tin bounding box
+                        bbox_width = x2 - x1
+                        bbox_height = y2 - y1
+                        bbox_area = bbox_width * bbox_height
+                        
+                        # Kiểm tra đa tầng thông minh
+                        size_ok = self.is_reasonable_size(class_name, bbox_width, bbox_height, 
+                                                        frame.shape[1], frame.shape[0])
+                        position_ok = self.is_reasonable_position(class_name, x1, y1, x2, y2, 
+                                                                frame.shape[1], frame.shape[0])
+                        
+                        # Áp dụng context boost
+                        context_boost = self.get_context_boost(class_name, all_detections)
+                        adjusted_confidence = confidence + context_boost
+                        
                         # Kiểm tra confidence và độ ổn định
-                        if (confidence > confidence_threshold and 
-                            self.is_stable_detection(class_name, confidence)):
+                        if (adjusted_confidence > confidence_threshold and 
+                            size_ok and position_ok and
+                            self.is_stable_detection(class_name, adjusted_confidence, bbox_area)):
                             # Nhận diện chính thức - màu xanh
                             current_objects[vietnamese_name] += 1
                             box_color = (0, 255, 0)  # Xanh lá
                             text_bg_color = (0, 255, 0)
-                            status = "OK"
-                        elif confidence > 0.5:
+                            status = "✓"
+                            
+                            # Thưởng cho detection đúng
+                            if self.false_positive_penalty.get(class_name, 0) > 0:
+                                self.false_positive_penalty[class_name] *= 0.8
+                                
+                        elif confidence > 0.5 and size_ok:
                             # Nghi ngờ - màu vàng
                             box_color = (0, 255, 255)  # Vàng
                             text_bg_color = (0, 255, 255)
-                            status = "?"
+                            
+                            # Phân loại lý do nghi ngờ
+                            if not position_ok:
+                                status = "Pos?"
+                            elif confidence <= confidence_threshold:
+                                status = "Conf?"
+                            else:
+                                status = "Wait"
+                        elif confidence > 0.3:
+                            # Confidence thấp - màu đỏ nhạt
+                            box_color = (128, 128, 255)  # Đỏ nhạt
+                            text_bg_color = (128, 128, 255)
+                            status = "Low"
                         else:
                             # Bỏ qua confidence quá thấp
                             continue
@@ -448,8 +608,19 @@ class ObjectDetectionApp:
                 # Thực hiện detection
                 results = self.model(frame, verbose=False)
                 
-                # Vẽ predictions
-                frame, current_objects = self.draw_predictions(frame, results)
+                # Lấy danh sách tất cả detections để phân tích context
+                all_detections = []
+                for result in results:
+                    if result.boxes is not None:
+                        for box in result.boxes:
+                            class_id = int(box.cls[0])
+                            class_name = self.model.names[class_id]
+                            confidence = box.conf[0]
+                            if confidence > 0.3:  # Chỉ xét các detection có confidence tối thiểu
+                                all_detections.append(class_name)
+                
+                # Vẽ predictions với thông tin context
+                frame, current_objects = self.draw_predictions(frame, results, all_detections)
                 
                 # Cập nhật object counts (sử dụng tên tiếng Việt)
                 for vietnamese_name in current_objects:
@@ -464,13 +635,20 @@ class ObjectDetectionApp:
                 cv2.putText(frame, f"FPS: {int(self.cap.get(cv2.CAP_PROP_FPS))}", 
                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 
-                # Thông tin chế độ lọc
-                cv2.putText(frame, "Xanh: Xac nhan | Vang: Nghi ngo", 
+                # Thông tin chế độ lọc và thống kê
+                cv2.putText(frame, "Xanh: OK | Vang: Nghi ngo | Do: Yeu", 
                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
+                # Hiển thị số lượng đối tượng đang theo dõi
+                tracking_count = len([k for k, v in self.object_stability.items() if v > 5])
+                cv2.putText(frame, f"Dang theo doi: {tracking_count} doi tuong", 
+                           (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+                
                 # Thêm hướng dẫn sử dụng (dùng ký tự an toàn)
-                cv2.putText(frame, "Q: Thoat | S: Chup anh | R: Reset | L: Luu log", 
-                           (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, "Q: Thoat | S: Chup | R: Reset | L: Log | M: Mode", 
+                           (10, frame.shape[0] - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                cv2.putText(frame, f"Che do hien tai: {self.smart_mode}", 
+                           (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 255, 100), 1)
                 
                 # Hiển thị frame với tiêu đề tiếng Việt
                 cv2.imshow('Ung dung AI Nhan dien Do vat - Nhan Q de thoat', frame)
@@ -494,6 +672,23 @@ class ObjectDetectionApp:
                     print("🔄 Đã reset bộ đếm và lịch sử nhận diện")
                 elif key == ord('l'):  # Lưu log
                     self.save_log_to_csv()
+                elif key == ord('m'):  # Chuyển đổi chế độ thông minh
+                    modes = ["normal", "strict", "sensitive"]
+                    current_idx = modes.index(self.smart_mode)
+                    self.smart_mode = modes[(current_idx + 1) % len(modes)]
+                    print(f"🧠 Chuyển sang chế độ: {self.smart_mode}")
+                    
+                    # Điều chỉnh threshold theo chế độ
+                    if self.smart_mode == "strict":
+                        # Chế độ nghiêm ngặt - ít false positive
+                        for key in self.confidence_thresholds:
+                            if key != 'default':
+                                self.confidence_thresholds[key] *= 1.2
+                    elif self.smart_mode == "sensitive":
+                        # Chế độ nhạy cảm - nhiều detection hơn
+                        for key in self.confidence_thresholds:
+                            if key != 'default':
+                                self.confidence_thresholds[key] *= 0.8
         
         except KeyboardInterrupt:
             print("\n⚠️  Người dùng dừng ứng dụng")
